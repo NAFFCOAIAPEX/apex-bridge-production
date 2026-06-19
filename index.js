@@ -97,10 +97,32 @@ async function getDataverseToken() {
   return token.token;
 }
 
-// Get estimation data from Dataverse
-async function getFromDataverse() {
+// Batch operations with error handling per-request
+async function batchOperations(items, operation, batchSize = 10) {
+  const results = [];
+  const errors = [];
+
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize);
+    const promises = batch.map(item =>
+      operation(item)
+        .then(result => ({ success: true, data: result }))
+        .catch(err => ({ success: false, item, error: err.message }))
+    );
+    const batchResults = await Promise.all(promises);
+    batchResults.forEach(result => {
+      if (result.success) results.push(result.data);
+      else errors.push(result);
+    });
+  }
+
+  return { results, errors };
+}
+
+// Get all requests from individual rows (skip 'apex-data' and 'diary-data')
+async function getAllRequestsFromDataverse() {
   const token = await getDataverseToken();
-  const filter = `$filter=${NAME_FIELD} eq '${RECORD_NAME}'&$select=${FIELD_NAME},cr8a9_estimationdata1id`;
+  const filter = `$filter=${NAME_FIELD} ne 'apex-data' and ${NAME_FIELD} ne 'diary-data'&$select=${FIELD_NAME},${NAME_FIELD},cr8a9_estimationdata1id`;
   const url = `${DATAVERSE_URL}/api/data/v9.2/${TABLE_NAME}?${filter}`;
   const res = await fetch(url, {
     headers: {
@@ -112,20 +134,124 @@ async function getFromDataverse() {
   });
   if (!res.ok) throw new Error(`Dataverse GET failed: ${res.status} ${await res.text()}`);
   const data = await res.json();
-  if (!data.value || data.value.length === 0) return { requests: [], diaryEntries: [], recordId: null };
-  const record = data.value[0];
-  const recordId = record.cr8a9_estimationdata1id;
-  const parsed = JSON.parse(record[FIELD_NAME] || '{}');
-  return { requests: parsed.requests || [], diaryEntries: parsed.diaryEntries || [], recordId };
+
+  const requests = (data.value || []).map(row => {
+    try {
+      const parsed = JSON.parse(row[FIELD_NAME] || '{}');
+      return { ...parsed, _recordId: row.cr8a9_estimationdata1id };
+    } catch (e) {
+      console.error(`Failed to parse row ${row[NAME_FIELD]}:`, e);
+      return null;
+    }
+  }).filter(r => r !== null);
+
+  return requests;
 }
 
-// Save estimation data to Dataverse
-async function saveToDataverse(payload, recordId) {
+// Get diary entries from special row
+async function getDiaryEntriesFromDataverse() {
   const token = await getDataverseToken();
-  const body = JSON.stringify({ [FIELD_NAME]: JSON.stringify(payload) });
+  const filter = `$filter=${NAME_FIELD} eq 'diary-data'&$select=${FIELD_NAME},cr8a9_estimationdata1id`;
+  const url = `${DATAVERSE_URL}/api/data/v9.2/${TABLE_NAME}?${filter}`;
+  const res = await fetch(url, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'OData-MaxVersion': '4.0',
+      'OData-Version': '4.0',
+      'Accept': 'application/json',
+    }
+  });
+  if (!res.ok) throw new Error(`Dataverse GET failed for diary: ${res.status} ${await res.text()}`);
+  const data = await res.json();
+
+  if (!data.value || data.value.length === 0) {
+    return { entries: [], recordId: null };
+  }
+
+  const record = data.value[0];
+  const parsed = JSON.parse(record[FIELD_NAME] || '{}');
+  return {
+    entries: Array.isArray(parsed) ? parsed : (parsed.entries || []),
+    recordId: record.cr8a9_estimationdata1id
+  };
+}
+
+// Save single request (new or update)
+async function saveRequestToDataverse(request) {
+  const token = await getDataverseToken();
+  const requestId = request.id;
+
+  // Check if request already exists
+  const filter = `$filter=${NAME_FIELD} eq '${requestId.replace(/'/g, "''")}'&$select=cr8a9_estimationdata1id`;
+  const checkUrl = `${DATAVERSE_URL}/api/data/v9.2/${TABLE_NAME}?${filter}`;
+  const checkRes = await fetch(checkUrl, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'OData-MaxVersion': '4.0',
+      'OData-Version': '4.0',
+      'Accept': 'application/json',
+    }
+  });
+
+  if (!checkRes.ok) throw new Error(`Dataverse check failed: ${checkRes.status}`);
+  const checkData = await checkRes.json();
+  const existingRecord = checkData.value?.[0];
+
+  // Prepare payload - remove internal fields
+  const { _recordId, ...requestData } = request;
+  const body = JSON.stringify({ [FIELD_NAME]: JSON.stringify(requestData) });
+
+  if (existingRecord) {
+    // Update existing record
+    const recordId = existingRecord.cr8a9_estimationdata1id;
+    const updateUrl = `${DATAVERSE_URL}/api/data/v9.2/${TABLE_NAME}(${recordId})`;
+    const res = await fetch(updateUrl, {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'OData-MaxVersion': '4.0',
+        'OData-Version': '4.0',
+        'If-Match': '*',
+      },
+      body
+    });
+    if (!res.ok && res.status !== 204) {
+      throw new Error(`Dataverse PATCH failed for ${requestId}: ${res.status} ${await res.text()}`);
+    }
+    return { action: 'updated', id: requestId, recordId };
+  } else {
+    // Create new record
+    const createUrl = `${DATAVERSE_URL}/api/data/v9.2/${TABLE_NAME}`;
+    const res = await fetch(createUrl, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'OData-MaxVersion': '4.0',
+        'OData-Version': '4.0',
+      },
+      body: JSON.stringify({ [NAME_FIELD]: requestId, [FIELD_NAME]: JSON.stringify(requestData) })
+    });
+    if (!res.ok) {
+      throw new Error(`Dataverse POST failed for ${requestId}: ${res.status} ${await res.text()}`);
+    }
+    const responseData = await res.json();
+    return { action: 'created', id: requestId, recordId: responseData.cr8a9_estimationdata1id };
+  }
+}
+
+// Save diary entries to special row
+async function saveDiaryEntriesToDataverse(entries) {
+  const token = await getDataverseToken();
+
+  // Get existing diary row
+  const { recordId } = await getDiaryEntriesFromDataverse();
+
+  const body = JSON.stringify({ [FIELD_NAME]: JSON.stringify(entries) });
 
   if (recordId) {
-    // Update existing record
+    // Update existing
     const url = `${DATAVERSE_URL}/api/data/v9.2/${TABLE_NAME}(${recordId})`;
     const res = await fetch(url, {
       method: 'PATCH',
@@ -138,9 +264,12 @@ async function saveToDataverse(payload, recordId) {
       },
       body
     });
-    if (!res.ok && res.status !== 204) throw new Error(`Dataverse PATCH failed: ${res.status} ${await res.text()}`);
+    if (!res.ok && res.status !== 204) {
+      throw new Error(`Dataverse diary PATCH failed: ${res.status} ${await res.text()}`);
+    }
+    return { action: 'updated', recordId };
   } else {
-    // Create new record
+    // Create new
     const url = `${DATAVERSE_URL}/api/data/v9.2/${TABLE_NAME}`;
     const res = await fetch(url, {
       method: 'POST',
@@ -150,9 +279,37 @@ async function saveToDataverse(payload, recordId) {
         'OData-MaxVersion': '4.0',
         'OData-Version': '4.0',
       },
-      body: JSON.stringify({ [NAME_FIELD]: RECORD_NAME, [FIELD_NAME]: JSON.stringify(payload) })
+      body: JSON.stringify({ [NAME_FIELD]: 'diary-data', [FIELD_NAME]: JSON.stringify(entries) })
     });
-    if (!res.ok) throw new Error(`Dataverse POST failed: ${res.status} ${await res.text()}`);
+    if (!res.ok) {
+      throw new Error(`Dataverse diary POST failed: ${res.status} ${await res.text()}`);
+    }
+    const responseData = await res.json();
+    return { action: 'created', recordId: responseData.cr8a9_estimationdata1id };
+  }
+}
+
+// Get estimation data from Dataverse (legacy - for backward compatibility with getEstimationDataWithArchive)
+async function getFromDataverse() {
+  const requests = await getAllRequestsFromDataverse();
+  const { entries: diaryEntries } = await getDiaryEntriesFromDataverse();
+  return { requests, diaryEntries, recordId: null };
+}
+
+// Save estimation data to Dataverse (legacy - routes to per-row saves)
+async function saveToDataverse(payload, recordId) {
+  const requests = payload.requests || [];
+  const diaryEntries = payload.diaryEntries || [];
+
+  // Save requests using batch operations
+  const { results, errors } = await batchOperations(requests, saveRequestToDataverse, 10);
+
+  if (diaryEntries.length > 0) {
+    await saveDiaryEntriesToDataverse(diaryEntries);
+  }
+
+  if (errors.length > 0) {
+    throw new Error(`Failed to save ${errors.length} requests: ${errors.map(e => e.error).join('; ')}`);
   }
 }
 
@@ -277,9 +434,7 @@ app.http('saveEstimationData', {
       const payload = await request.json();
       context.log(`Saving ${(payload.requests || []).length} requests to Dataverse...`);
 
-      // Get current record ID
-      const { recordId } = await getFromDataverse();
-      await saveToDataverse(payload, recordId);
+      await saveToDataverse(payload, null);
 
       context.log('Saved successfully');
       return {
@@ -289,6 +444,103 @@ app.http('saveEstimationData', {
       };
     } catch (err) {
       context.log(`Error: ${err.message}`);
+      return {
+        status: 500,
+        headers: { 'Access-Control-Allow-Origin': '*' },
+        jsonBody: { error: err.message }
+      };
+    }
+  }
+});
+
+// ─── FUNCTION 4b: Migrate to Per-Row Storage ──────────────────────────────────
+app.http('migrateToPerRow', {
+  methods: ['POST', 'OPTIONS'],
+  authLevel: 'anonymous',
+  handler: async (request, context) => {
+    if (request.method === 'OPTIONS') {
+      return { status: 204, headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET,POST,OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' } };
+    }
+    try {
+      const payload = await request.json();
+      const backupJsonString = payload.backup || null;
+
+      context.log('Starting migration from blob to per-row storage...');
+
+      const token = await getDataverseToken();
+
+      // 1. Read the old 'apex-data' blob row
+      const filter = `$filter=${NAME_FIELD} eq 'apex-data'&$select=${FIELD_NAME},cr8a9_estimationdata1id`;
+      const url = `${DATAVERSE_URL}/api/data/v9.2/${TABLE_NAME}?${filter}`;
+      const res = await fetch(url, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'OData-MaxVersion': '4.0',
+          'OData-Version': '4.0',
+          'Accept': 'application/json',
+        }
+      });
+
+      if (!res.ok) throw new Error(`Failed to fetch old blob: ${res.status} ${await res.text()}`);
+      const data = await res.json();
+
+      let requests = [];
+      let oldBlobRecordId = null;
+
+      if (data.value && data.value.length > 0) {
+        const oldRecord = data.value[0];
+        oldBlobRecordId = oldRecord.cr8a9_estimationdata1id;
+        const oldBlob = JSON.parse(oldRecord[FIELD_NAME] || '{}');
+        requests = oldBlob.requests || [];
+        context.log(`Found old blob with ${requests.length} requests`);
+      }
+
+      // 2. Load from backup if provided
+      if (backupJsonString) {
+        try {
+          const backupData = JSON.parse(backupJsonString);
+          const backupRequests = Array.isArray(backupData) ? backupData : (backupData.requests || []);
+          const existingIds = new Set(requests.map(r => r.id));
+          const newRequests = backupRequests.filter(r => !existingIds.has(r.id));
+          requests.push(...newRequests);
+          context.log(`Merged backup: +${newRequests.length} new requests`);
+        } catch (e) {
+          throw new Error(`Failed to parse backup JSON: ${e.message}`);
+        }
+      }
+
+      if (requests.length === 0) {
+        return {
+          status: 200,
+          headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' },
+          jsonBody: { success: true, migratedCount: 0, message: 'No requests to migrate', timestamp: new Date().toISOString() }
+        };
+      }
+
+      // 3. Create individual rows using batch operations
+      const { results, errors } = await batchOperations(requests, saveRequestToDataverse, 10);
+
+      const created = results.filter(r => r.action === 'created').length;
+      const updated = results.filter(r => r.action === 'updated').length;
+
+      context.log(`Migration complete: ${created} created, ${updated} updated, ${errors.length} errors`);
+
+      return {
+        status: 200,
+        headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' },
+        jsonBody: {
+          success: errors.length === 0,
+          migratedCount: requests.length,
+          created,
+          updated,
+          errors: errors.length > 0 ? errors.map(e => ({ id: e.item.id, error: e.error })) : undefined,
+          oldBlobRecordId: oldBlobRecordId,
+          message: errors.length === 0 ? 'Migration completed successfully' : `Migration completed with ${errors.length} errors`,
+          timestamp: new Date().toISOString()
+        }
+      };
+    } catch (err) {
+      context.log(`Migration error: ${err.message}`);
       return {
         status: 500,
         headers: { 'Access-Control-Allow-Origin': '*' },
